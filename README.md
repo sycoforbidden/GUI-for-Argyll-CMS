@@ -2,7 +2,7 @@
 
 A graphical interface for the ArgyllCMS CMYK printer profiling workflow, built with Python and PySide6.
 
-Wraps 5 ArgyllCMS command-line tools into a step-by-step workflow with the main focus on **chartread** — providing real-time visual feedback of expected vs measured patch colors so you can catch misreadings before they ruin your profile.
+Wraps 5 ArgyllCMS command-line tools into a step-by-step workflow with the main focus on **chartread**  providing real-time visual feedback of expected vs measured patch colours so you can catch misreadings before they ruin your profile.
 
 ## The Problem This Solves
 
