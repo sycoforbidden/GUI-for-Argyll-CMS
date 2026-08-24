@@ -142,10 +142,20 @@ def device_color_to_rgb(device_values, color_space='CMYK'):
     device_values: list of floats (0-100 range)
     color_space: 'CMYK', 'RGB', 'CMY'
     """
-    if color_space.upper() == 'CMYK' and len(device_values) >= 4:
+    if not device_values:
+        return (128, 128, 128)
+
+    cs = color_space.upper()
+    
+    if cs == 'CMYK' and len(device_values) >= 4:
         return cmyk_to_rgb(*device_values[:4])
-    elif color_space.upper() == 'RGB' and len(device_values) >= 3:
-        return tuple(int(v * 255 / 100) for v in device_values[:3])
-    elif color_space.upper() == 'CMY' and len(device_values) >= 3:
+    elif cs == 'RGB' and len(device_values) >= 3:
+        # Argyll device RGB targets are expressed in 0-100 percentage values
+        r = int(max(0, min(255, round(device_values[0] * 2.55))))
+        g = int(max(0, min(255, round(device_values[1] * 2.55))))
+        b = int(max(0, min(255, round(device_values[2] * 2.55))))
+        return (r, g, b)
+    elif cs == 'CMY' and len(device_values) >= 3:
         return cmyk_to_rgb(device_values[0], device_values[1], device_values[2], 0)
+        
     return (128, 128, 128)  # fallback gray

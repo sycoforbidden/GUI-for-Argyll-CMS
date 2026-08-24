@@ -97,10 +97,10 @@ class CGATSFile:
 
     def get_color_space(self):
         """Return the color space string (e.g. 'CMYK', 'RGB')."""
-        cs = self.keywords.get('COLOR_REP', '')
+        cs = self.keywords.get('COLOR_REP', '').upper()
         if '_' in cs:
             return cs.split('_')[0]
-        return cs
+        return cs if cs else 'CMYK'
 
     def get_device_fields(self):
         """Return list of device value field names."""
@@ -111,9 +111,11 @@ class CGATSFile:
             'CMY':  ['CMY_C', 'CMY_M', 'CMY_Y'],
         }
         if cs in mapping:
-            return [f for f in mapping[cs] if f in self.fields]
+            fields = [f for f in mapping[cs] if f in self.fields]
+            if fields:
+                return fields
         # Fallback: find fields matching common patterns
-        dev_fields = [f for f in self.fields if any(
+        return [f for f in self.fields if any(
             f.startswith(p) for p in ['CMYK_', 'RGB_', 'CMY_']
         )]
         return dev_fields

@@ -49,6 +49,12 @@ class TargenPanel(QWidget):
         patch_group = QGroupBox("Patch Configuration")
         patch_layout = QFormLayout(patch_group)
 
+        # ADD THIS: Color Space selector
+        self.color_space_combo = QComboBox()
+        self.color_space_combo.addItems(["CMYK", "RGB"])
+        self.color_space_combo.currentTextChanged.connect(self._on_color_space_changed)
+        patch_layout.addRow("Color Space:", self.color_space_combo)
+
         self.total_patches_spin = QSpinBox()
         self.total_patches_spin.setRange(50, 10000)
         self.total_patches_spin.setValue(836)
@@ -167,7 +173,11 @@ class TargenPanel(QWidget):
         return self.basename_edit.text()
 
     def _build_args(self):
-        args = ['-v', '-d', '4']  # CMYK
+        args = ['-v']
+
+        # Determine device color space flag: -d 2 for RGB, -d 4 for CMYK
+        is_rgb = (self.color_space_combo.currentText() == "RGB")
+        args.extend(['-d', '2' if is_rgb else '4'])
 
         args.extend(['-f', str(self.total_patches_spin.value())])
         args.extend(['-e', str(self.white_patches_spin.value())])
@@ -177,7 +187,8 @@ class TargenPanel(QWidget):
         if self.gray_steps_spin.value() > 0:
             args.extend(['-g', str(self.gray_steps_spin.value())])
 
-        if self.ink_limit_spin.value() > 0:
+        # Apply ink limit ONLY if CMYK is selected
+        if not is_rgb and self.ink_limit_spin.value() > 0:
             args.extend(['-l', str(self.ink_limit_spin.value())])
 
         algo_map = {
@@ -221,6 +232,11 @@ class TargenPanel(QWidget):
 
     def _on_output(self, text):
         self.log.append(text)
+
+    def _on_color_space_changed(self, text):
+        """Toggle CMYK-only controls when switching between CMYK and RGB."""
+        is_cmyk = (text == "CMYK")
+        self.ink_limit_spin.setEnabled(is_cmyk)
 
     def _on_finished(self, exit_code, status):
         self.run_btn.setEnabled(True)

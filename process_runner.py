@@ -6,9 +6,18 @@ Wraps QProcess for async execution with signal-based output.
 import os
 from PySide6.QtCore import QObject, Signal, QProcess, QTimer
 
+"""
+Subprocess runner for ArgyllCMS command-line tools.
+Wraps subprocess and QProcess for terminal or async execution.
+"""
+
+import os
+import subprocess
+from PySide6.QtCore import QObject, Signal, QProcess, QTimer
+
 
 class ArgyllProcess(QObject):
-    """Manages an ArgyllCMS subprocess with async I/O."""
+    """Manages an ArgyllCMS subprocess with terminal or async I/O."""
 
     output_received = Signal(str)   # stdout line
     error_received = Signal(str)    # stderr line
@@ -19,96 +28,62 @@ class ArgyllProcess(QObject):
         super().__init__(parent)
         self.bin_dir = bin_dir
         self.process = None
-        self._buffer = b''
-        self._err_buffer = b''
+        self.native_proc = None
+        self._poll_timer = QTimer(self)
+        self._poll_timer.setInterval(500)
+        self._poll_timer.timeout.connect(self._check_native_finished)
 
-    def start(self, exe_name, args, working_dir=None):
-        """Start an ArgyllCMS executable with given arguments."""
-        if self.process and self.process.state() != QProcess.NotRunning:
-            self.process.kill()
-            self.process.waitForFinished(3000)
-
-        self.process = QProcess(self)
-        self.process.setProcessChannelMode(QProcess.SeparateChannels)
-
-        if working_dir:
-            self.process.setWorkingDirectory(str(working_dir))
-
-        self.process.readyReadStandardOutput.connect(self._on_stdout)
-        self.process.readyReadStandardError.connect(self._on_stderr)
-        self.process.finished.connect(self._on_finished)
-        self.process.started.connect(self.started.emit)
-
+    def start_in_console(self, exe_name, args, working_dir=None):
         exe_path = os.path.join(self.bin_dir, exe_name)
         if os.name == 'nt' and not exe_name.endswith('.exe'):
             exe_path += '.exe'
 
-        self.process.start(exe_path, args)
+        if os.name == 'nt':
+            # Use /c so cmd.exe closes naturally when chartread finishes
+            cmd = ['cmd.exe', '/c', exe_path] + list(args)
+            creationflags = subprocess.CREATE_NEW_CONSOLE
+        else:
+            cmd = [exe_path] + list(args)
+            creationflags = 0
+
+        self.native_proc = subprocess.Popen(
+            cmd,
+            cwd=str(working_dir) if working_dir else None,
+            creationflags=creationflags
+        )
+        self.started.emit()
+        self._poll_timer.start()
+
+    def _check_native_finished(self):
+        if self.native_proc is not None:
+            ret_code = self.native_proc.poll()
+            if ret_code is not None:
+                self._poll_timer.stop()
+                self.native_proc = None
+                
+                # Convert unsigned 32-bit uint to signed 32-bit int
+                if ret_code > 2147483647:
+                    ret_code -= 4294967296
+
+                # 0 = clean exit, -1073741510 / 1 = user quit / closed window
+                if ret_code in (0, 1, -1073741510):
+                    status = 'normal'
+                else:
+                    status = 'error'
+
+                self.finished.emit(ret_code, status)
 
     def send_input(self, text):
-        """Send text to the process stdin."""
-        if self.process and self.process.state() == QProcess.Running:
-            self.process.write((text).encode('utf-8'))
+        pass  # Keyboard input goes straight into the opened console window
 
     def send_key(self, key):
-        """Send a single key/character to stdin."""
-        self.send_input(key)
+        pass
 
     def is_running(self):
+        if self.native_proc:
+            return self.native_proc.poll() is None
         return self.process is not None and self.process.state() == QProcess.Running
 
     def terminate(self):
-        """Terminate the running process."""
-        if self.process and self.process.state() != QProcess.NotRunning:
-            self.process.terminate()
-            QTimer.singleShot(3000, self._force_kill)
-
-    def kill(self):
-        """Force kill the running process."""
-        if self.process and self.process.state() != QProcess.NotRunning:
-            self.process.kill()
-
-    def _force_kill(self):
-        if self.process and self.process.state() != QProcess.NotRunning:
-            self.process.kill()
-
-    def _on_stdout(self):
-        data = self.process.readAllStandardOutput().data()
-        self._buffer += data
-        while b'\n' in self._buffer:
-            line, self._buffer = self._buffer.split(b'\n', 1)
-            text = line.decode('utf-8', errors='replace').rstrip('\r')
-            self.output_received.emit(text)
-        # Also emit partial lines (prompts don't end with newline)
-        if self._buffer:
-            # Check for common prompt patterns
-            partial = self._buffer.decode('utf-8', errors='replace')
-            if any(p in partial for p in [':', '?', '>', '(', 'key']):
-                self.output_received.emit(partial)
-                self._buffer = b''
-
-    def _on_stderr(self):
-        data = self.process.readAllStandardError().data()
-        self._err_buffer += data
-        while b'\n' in self._err_buffer:
-            line, self._err_buffer = self._err_buffer.split(b'\n', 1)
-            text = line.decode('utf-8', errors='replace').rstrip('\r')
-            self.error_received.emit(text)
-        if self._err_buffer:
-            partial = self._err_buffer.decode('utf-8', errors='replace')
-            self.error_received.emit(partial)
-            self._err_buffer = b''
-
-    def _on_finished(self, exit_code, exit_status):
-        # Flush remaining buffers
-        if self._buffer:
-            self.output_received.emit(
-                self._buffer.decode('utf-8', errors='replace').rstrip('\r'))
-            self._buffer = b''
-        if self._err_buffer:
-            self.error_received.emit(
-                self._err_buffer.decode('utf-8', errors='replace').rstrip('\r'))
-            self._err_buffer = b''
-
-        status_str = 'normal' if exit_status == QProcess.NormalExit else 'crashed'
-        self.finished.emit(exit_code, status_str)
+        if self.native_proc and self.native_proc.poll() is None:
+            self.native_proc.terminate()

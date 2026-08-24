@@ -17,7 +17,6 @@ from main_window import MainWindow
 
 
 def find_bin_dir():
-    """Locate the ArgyllCMS bin directory relative to this script."""
     # Expected layout: Argyll_V3.5.0/gui/main.py -> Argyll_V3.5.0/bin/
     base = gui_dir.parent
     bin_dir = base / 'bin'

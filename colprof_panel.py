@@ -158,7 +158,7 @@ class ColprofPanel(QWidget):
         if basename:
             self.basename_edit.setText(basename)
 
-    def _build_args(self):
+    def _build_args(self, color_space='CMYK'):
         args = ['-v']
 
         quality_flags = ['l', 'm', 'h', 'u']
@@ -173,7 +173,8 @@ class ColprofPanel(QWidget):
         }
         args.extend(algo_map.get(self.algorithm_combo.currentIndex(), []))
 
-        if self.ink_limit_spin.value() > 0:
+        # Ink limit is only valid for CMYK workflows
+        if color_space.upper() == 'CMYK' and self.ink_limit_spin.value() > 0:
             args.extend(['-l', str(self.ink_limit_spin.value())])
 
         if self.bpo_check.isChecked():
@@ -188,7 +189,6 @@ class ColprofPanel(QWidget):
         if self.copyright_edit.text():
             args.extend(['-C', self.copyright_edit.text()])
 
-        # Extra args
         if self.extra_args_edit.text():
             args.extend(self.extra_args_edit.text().split())
 
@@ -201,16 +201,26 @@ class ColprofPanel(QWidget):
             QMessageBox.warning(self, "Error", "Please select a working directory.")
             return
 
-        ti3 = Path(work_dir) / f"{self.basename_edit.text()}.ti3"
-        if not ti3.exists():
+        ti3_path = Path(work_dir) / f"{self.basename_edit.text()}.ti3"
+        if not ti3_path.exists():
             QMessageBox.warning(self, "Error",
-                f"Input file not found: {ti3}\nRun chartread first.")
+                f"Input file not found: {ti3_path}\nRun chartread first.")
             return
+
+        # Auto-detect target color space
+        color_space = 'CMYK'
+        try:
+            ti3 = CGATSFile.parse(ti3_path)
+            color_space = ti3.get_color_space() or 'CMYK'
+        except Exception:
+            pass
+
+        args = self._build_args(color_space=color_space)
 
         self.log.clear()
         self.run_btn.setEnabled(False)
-        self.log.append(f"Running: colprof {' '.join(self._build_args())}\n")
-        self.process.start('colprof', self._build_args(), work_dir)
+        self.log.append(f"Running colprof for {color_space}: colprof {' '.join(args)}\n")
+        self.process.start('colprof', args, work_dir)
 
     def _on_output(self, text):
         self.log.append(text)

@@ -7,6 +7,7 @@ Designed for ColorMunki Photo / CMYK workflow.
 """
 
 import re
+
 from pathlib import Path
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox,
@@ -15,7 +16,8 @@ from PySide6.QtWidgets import (
     QGridLayout, QFrame, QToolTip, QSizePolicy, QHeaderView,
     QTableWidget, QTableWidgetItem, QAbstractItemView
 )
-from PySide6.QtCore import Qt, Signal, QSize, QTimer
+from PySide6.QtCore import QSettings, Qt, Signal, QSize, QTimer, Slot
+from PySide6.QtWidgets import QDoubleSpinBox
 from PySide6.QtGui import QColor, QPainter, QFont, QBrush, QPen, QCursor
 
 from cgats import CGATSFile
@@ -30,9 +32,7 @@ from process_runner import ArgyllProcess
 # Patch swatch widget - shows a single color patch with optional comparison
 # ---------------------------------------------------------------------------
 class PatchSwatch(QFrame):
-    """A clickable color patch that shows expected and optionally measured color."""
-
-    clicked = Signal(int)  # patch index
+    clicked = Signal(int)
 
     def __init__(self, index, parent=None):
         super().__init__(parent)
@@ -43,18 +43,69 @@ class PatchSwatch(QFrame):
         self.delta_e = None
         self.is_read = False
         self.is_current_strip = False
-        self.cmyk = (0, 0, 0, 0)
+        self.is_dimmed = False  # Track opacity state
         self.expected_lab = None
         self.measured_lab = None
+        
+        # Default thresholds
+        self.de_warn = 5.0
+        self.de_err = 10.0
 
         self.setMinimumSize(18, 18)
         self.setMaximumSize(40, 40)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setCursor(Qt.PointingHandCursor)
 
-    def set_expected(self, rgb, cmyk=None, lab=None, location=""):
+    def set_dimmed(self, dimmed):
+        """Set opacity state for filtering."""
+        if self.is_dimmed != dimmed:
+            self.is_dimmed = dimmed
+            self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+
+        # Apply 20% opacity (alpha = 0.2) if dimmed out by filter
+        if self.is_dimmed:
+            p.setOpacity(0.2)
+
+        rect = self.rect().adjusted(1, 1, -1, -1)
+
+        if self.is_read and self.measured_rgb:
+            mid = rect.width() // 2
+            left_rect = rect.adjusted(0, 0, -(rect.width() - mid), 0)
+            right_rect = rect.adjusted(mid, 0, 0, 0)
+            p.fillRect(left_rect, QColor(*self.expected_rgb))
+            p.fillRect(right_rect, QColor(*self.measured_rgb))
+        else:
+            p.fillRect(rect, QColor(*self.expected_rgb))
+
+        # Dynamic Delta E border coloring
+        if self.delta_e is not None and self.delta_e >= self.de_err:
+            p.setPen(QPen(QColor(255, 0, 0), 3))  # Red border
+        elif self.delta_e is not None and self.delta_e >= self.de_warn:
+            p.setPen(QPen(QColor(255, 165, 0), 2))  # Yellow/Orange border
+        elif self.is_current_strip:
+            p.setPen(QPen(QColor(0, 120, 255), 2))
+        elif self.is_read:
+            p.setPen(QPen(QColor(0, 180, 0), 1))  # Green border
+        else:
+            p.setPen(QPen(QColor(100, 100, 100), 1))
+
+        p.drawRect(rect)
+        p.end()
+
+    def set_thresholds(self, de_warn, de_err):
+        """Update Delta E thresholds dynamically and force repaint."""
+        self.de_warn = de_warn
+        self.de_err = de_err
+        self.update()
+        self.repaint()
+
+    def set_expected(self, rgb, device_vals=None, lab=None, location=""):
         self.expected_rgb = rgb
-        self.cmyk = cmyk or (0, 0, 0, 0)
+        self.device_vals = device_vals or []
         self.expected_lab = lab
         self.location = location
         self.update()
@@ -70,47 +121,15 @@ class PatchSwatch(QFrame):
         self.is_current_strip = is_current
         self.update()
 
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        rect = self.rect().adjusted(1, 1, -1, -1)
-
-        if self.is_read and self.measured_rgb:
-            # Split view: left = expected, right = measured
-            mid = rect.width() // 2
-            left_rect = rect.adjusted(0, 0, -(rect.width() - mid), 0)
-            right_rect = rect.adjusted(mid, 0, 0, 0)
-
-            p.fillRect(left_rect, QColor(*self.expected_rgb))
-            p.fillRect(right_rect, QColor(*self.measured_rgb))
-        else:
-            p.fillRect(rect, QColor(*self.expected_rgb))
-
-        # Border
-        if self.delta_e is not None and self.delta_e > 10:
-            # High delta E - red warning border
-            p.setPen(QPen(QColor(255, 0, 0), 3))
-        elif self.delta_e is not None and self.delta_e > 5:
-            # Medium delta E - orange border
-            p.setPen(QPen(QColor(255, 165, 0), 2))
-        elif self.is_current_strip:
-            p.setPen(QPen(QColor(0, 120, 255), 2))
-        elif self.is_read:
-            p.setPen(QPen(QColor(0, 180, 0), 1))
-        else:
-            p.setPen(QPen(QColor(100, 100, 100), 1))
-
-        p.drawRect(rect)
-        p.end()
-
     def mousePressEvent(self, event):
         self.clicked.emit(self.index)
 
     def enterEvent(self, event):
         tip_parts = [f"Patch: {self.location}"]
-        tip_parts.append(
-            f"CMYK: {self.cmyk[0]:.1f} {self.cmyk[1]:.1f} "
-            f"{self.cmyk[2]:.1f} {self.cmyk[3]:.1f}")
+        if self.device_vals:
+            dev_str = " ".join(f"{v:.1f}" for v in self.device_vals)
+            label = "RGB" if len(self.device_vals) == 3 else "CMYK"
+            tip_parts.append(f"{label}: {dev_str}")
         if self.expected_lab:
             tip_parts.append(
                 f"Expected Lab: {self.expected_lab[0]:.1f} "
@@ -123,7 +142,6 @@ class PatchSwatch(QFrame):
             tip_parts.append(f"Delta E94: {self.delta_e:.2f}")
         QToolTip.showText(QCursor.pos(), "\n".join(tip_parts))
 
-
 # ---------------------------------------------------------------------------
 # Chart grid widget - shows all patches organized by strip
 # ---------------------------------------------------------------------------
@@ -131,11 +149,12 @@ class ChartGrid(QScrollArea):
     """Scrollable grid showing all patches organized by strip rows."""
 
     patch_clicked = Signal(int)
-
+    
     def __init__(self, parent=None):
         super().__init__(parent)
         self.patches = []  # list of PatchSwatch widgets
         self.strip_labels = {}  # strip_name -> QLabel
+        self.order_by_strip = False  # Toggle state
         self.container = QWidget()
         self.grid = QGridLayout(self.container)
         self.grid.setSpacing(2)
@@ -143,9 +162,11 @@ class ChartGrid(QScrollArea):
         self.setWidget(self.container)
         self.setWidgetResizable(True)
 
-    def load_chart(self, ti2_data, color_space='CMYK'):
+    def load_chart(self, ti2_data, color_space='CMYK', order_by_strip=False):
         """Load chart layout from parsed .ti2 CGATS data."""
-        # Clear existing
+        self.order_by_strip = order_by_strip
+
+        # Clear existing widgets
         for p in self.patches:
             p.deleteLater()
         self.patches.clear()
@@ -159,18 +180,47 @@ class ChartGrid(QScrollArea):
             if item.widget():
                 item.widget().deleteLater()
 
-        strips = ti2_data.get_strip_layout()
-        if not strips:
-            # No SAMPLE_LOC field - create a simple sequential layout
+        # --- MODE 1: FILE ORDER (Sequential grid, fix cramped UI & exact file order) ---
+        if not self.order_by_strip:
             self._load_sequential(ti2_data, color_space)
             return
+
+        # --- MODE 2: STRIP ORDER (Organized by strip A1, A2...) ---
+        strips = ti2_data.get_strip_layout() if hasattr(ti2_data, 'get_strip_layout') else {}
+        if not strips:
+            strips = {}
+            for data_idx, row in enumerate(ti2_data.data):
+                loc = str(row.get('SAMPLE_LOC', '')).strip('"\'')
+                match = re.match(r'^([A-Za-z]+)(\d+)$', loc)
+                if match:
+                    strip_name = match.group(1).upper()
+                    patch_num = int(match.group(2))
+                else:
+                    strip_name = "A"
+                    patch_num = data_idx + 1
+
+                if strip_name not in strips:
+                    strips[strip_name] = []
+                strips[strip_name].append((data_idx, patch_num, loc, row))
 
         device_fields = ti2_data.get_device_fields()
         has_xyz = 'XYZ_X' in ti2_data.fields
 
+        def parse_location_key(item):
+            loc_str = str(item[2]).strip('"\'')
+            match = re.match(r'^([A-Za-z]+)(\d+)$', loc_str)
+            if match:
+                return (match.group(1).upper(), int(match.group(2)))
+            return (loc_str, 0)
+
+        def strip_name_key(name):
+            clean_name = str(name).strip('"\'')
+            return (len(clean_name), clean_name)
+
         row = 0
-        for strip_name in sorted(strips.keys()):
-            # Strip label
+        sorted_strip_names = sorted(strips.keys(), key=strip_name_key)
+
+        for strip_name in sorted_strip_names:
             lbl = QLabel(f" {strip_name} ")
             lbl.setStyleSheet(
                 "QLabel { font-weight: bold; background: #e0e0e0; "
@@ -179,7 +229,9 @@ class ChartGrid(QScrollArea):
             self.grid.addWidget(lbl, row, 0)
             self.strip_labels[strip_name] = lbl
 
-            for col_idx, (data_idx, patch_num, loc, data_row) in enumerate(strips[strip_name]):
+            patch_items = sorted(list(strips[strip_name]), key=parse_location_key)
+
+            for col_idx, (data_idx, patch_num, loc, data_row) in enumerate(patch_items):
                 dev_vals = [float(data_row.get(f, 0)) for f in device_fields]
                 rgb = device_color_to_rgb(dev_vals, color_space)
 
@@ -190,38 +242,53 @@ class ChartGrid(QScrollArea):
                         lab = xyz_to_lab(*xyz)
                         rgb = xyz_to_rgb(*xyz)
 
+                clean_loc = str(loc).strip('"\'')
+
                 swatch = PatchSwatch(data_idx, self.container)
-                cmyk = tuple(dev_vals[:4]) if len(dev_vals) >= 4 else (0, 0, 0, 0)
-                swatch.set_expected(rgb, cmyk=cmyk, lab=lab, location=loc)
+                swatch.set_expected(rgb, device_vals=dev_vals, lab=lab, location=clean_loc)
                 swatch.clicked.connect(self.patch_clicked.emit)
                 self.grid.addWidget(swatch, row, col_idx + 1)
                 self.patches.append(swatch)
 
             row += 1
 
+        self.grid.activate()
+        self.container.adjustSize()
+        self.container.update()
+
     def _load_sequential(self, ti2_data, color_space):
-        """Fallback: arrange patches in a simple grid."""
+        """Fallback / File Order: arrange patches in exact sequential file order."""
         device_fields = ti2_data.get_device_fields()
-        cols_per_row = 21  # typical ColorMunki strip length
-        row = 0
-        col = 0
-        for idx, data_row in enumerate(ti2_data.data):
+        has_xyz = 'XYZ_X' in ti2_data.fields
+        cols_per_row = 25  # Fixed readable column limit per line
+
+        for data_idx, data_row in enumerate(ti2_data.data):
+            row = data_idx // cols_per_row
+            col = data_idx % cols_per_row
+
             dev_vals = [float(data_row.get(f, 0)) for f in device_fields]
             rgb = device_color_to_rgb(dev_vals, color_space)
-            cmyk = tuple(dev_vals[:4]) if len(dev_vals) >= 4 else (0, 0, 0, 0)
 
-            swatch = PatchSwatch(idx, self.container)
-            loc = data_row.get('SAMPLE_LOC', f'#{idx+1}')
-            swatch.set_expected(rgb, cmyk=cmyk, location=str(loc))
+            lab = None
+            if has_xyz:
+                xyz = ti2_data.get_xyz_values(data_row)
+                if len(xyz) == 3:
+                    lab = xyz_to_lab(*xyz)
+                    rgb = xyz_to_rgb(*xyz)
+
+            loc = data_row.get('SAMPLE_LOC', f"P{data_idx + 1}")
+            clean_loc = str(loc).strip('"\'')
+
+            swatch = PatchSwatch(data_idx, self.container)
+            swatch.set_expected(rgb, device_vals=dev_vals, lab=lab, location=clean_loc)
             swatch.clicked.connect(self.patch_clicked.emit)
             self.grid.addWidget(swatch, row, col)
             self.patches.append(swatch)
 
-            col += 1
-            if col >= cols_per_row:
-                col = 0
-                row += 1
-
+        self.grid.activate()
+        self.container.adjustSize()
+        self.container.update()
+    
     def highlight_strip(self, strip_name):
         """Highlight the current strip being read."""
         strips = {}
@@ -326,8 +393,8 @@ class PatchDetailPanel(QFrame):
 
         layout.addStretch()
 
-    def show_patch(self, patch):
-        """Update display for given PatchSwatch."""
+    def show_patch(self, patch, de_warn=5.0, de_err=10.0):
+        """Update display for given PatchSwatch using dynamic thresholds."""
         self.title_lbl.setText(f"Patch {patch.location}")
 
         # Expected color
@@ -347,8 +414,10 @@ class PatchDetailPanel(QFrame):
         # Info table
         rows = []
         rows.append(("Location", patch.location))
-        c, m, y, k = patch.cmyk
-        rows.append(("CMYK", f"{c:.1f}  {m:.1f}  {y:.1f}  {k:.1f}"))
+        if patch.device_vals:
+            dev_str = "  ".join(f"{v:.1f}" for v in patch.device_vals)
+            label = "RGB" if len(patch.device_vals) == 3 else "CMYK"
+            rows.append((label, dev_str))
         if patch.expected_lab:
             L, a, b = patch.expected_lab
             rows.append(("Expected Lab", f"{L:.1f}  {a:.1f}  {b:.1f}"))
@@ -364,16 +433,16 @@ class PatchDetailPanel(QFrame):
             self.info_table.setItem(i, 0, QTableWidgetItem(prop))
             self.info_table.setItem(i, 1, QTableWidgetItem(str(val)))
 
-        # Delta E display
+        # Dynamic Delta E display matching active thresholds
         if patch.delta_e is not None:
             de = patch.delta_e
-            if de > 10:
+            if de >= de_err:
                 color = "#ff0000"
                 verdict = "BAD - likely misread!"
-            elif de > 5:
+            elif de >= de_warn:
                 color = "#ff8800"
                 verdict = "Warning - check"
-            elif de > 2:
+            elif de > 2.0:
                 color = "#888800"
                 verdict = "Acceptable"
             else:
@@ -384,7 +453,6 @@ class PatchDetailPanel(QFrame):
                 f"font-size: 14pt; font-weight: bold; color: {color};")
         else:
             self.delta_e_lbl.setText("")
-
 
 # ---------------------------------------------------------------------------
 # Main Chartread Panel
@@ -400,35 +468,79 @@ class ChartreadPanel(QWidget):
         self.process.error_received.connect(self._on_error)
         self.process.finished.connect(self._on_finished)
 
+        self.settings = QSettings("ArgyllCMS_GUI", "ChartreadConfig")
+
         self.ti2_data = None
         self.current_strip = None
-        self.readings = {}        # patch_index -> measured Lab
-        self.strip_status = {}    # strip_name -> 'reading'|'done'
-        self._output_lines = []   # buffer for parsing multi-line output
+        self.readings = {}
+        self.strip_status = {}
+        self._output_lines = []
         self._misread_count = 0
         self._total_read = 0
 
         self._build_ui()
+        self._load_settings()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
 
-        # --- Top: file selection and options ---
+        # --- Top bar: Config controls, directory, file name ---
         top_bar = QHBoxLayout()
 
         self.work_dir_edit = QLineEdit()
         self.work_dir_edit.setPlaceholderText("Working directory...")
+        self.work_dir_edit.textChanged.connect(self._save_settings)
         dir_btn = QPushButton("Browse...")
         dir_btn.clicked.connect(self._browse_dir)
+
         top_bar.addWidget(QLabel("Dir:"))
         top_bar.addWidget(self.work_dir_edit, 1)
         top_bar.addWidget(dir_btn)
 
         self.basename_edit = QLineEdit("profile")
-        self.basename_edit.setMaximumWidth(150)
+        self.basename_edit.setMaximumWidth(120)
+        self.basename_edit.textChanged.connect(self._save_settings)
         top_bar.addWidget(QLabel("Name:"))
         top_bar.addWidget(self.basename_edit)
+
+        # --- Delta E Threshold SpinBoxes ---
+        top_bar.addWidget(QLabel("dE Warn:"))
+        self.de_warn_spin = QDoubleSpinBox()
+        self.de_warn_spin.setRange(0.1, 50.0)
+        self.de_warn_spin.setSingleStep(0.5)
+        self.de_warn_spin.setValue(5.0)
+        self.de_warn_spin.valueChanged.connect(self._on_threshold_changed)
+        top_bar.addWidget(self.de_warn_spin)
+
+        top_bar.addWidget(QLabel("dE Error:"))
+        self.de_err_spin = QDoubleSpinBox()
+        self.de_err_spin.setRange(0.1, 100.0)
+        self.de_err_spin.setSingleStep(0.5)
+        self.de_err_spin.setValue(10.0)
+        self.de_err_spin.valueChanged.connect(self._on_threshold_changed)
+        top_bar.addWidget(self.de_err_spin)
+
+        # Reset button
+        reset_btn = QPushButton("Reset Defaults")
+        reset_btn.setToolTip("Reset thresholds and path settings to defaults")
+        reset_btn.clicked.connect(self._reset_defaults)
+        top_bar.addWidget(reset_btn)
+
+        # Order by button
+        self.order_btn = QPushButton("Order: File")
+        self.order_btn.setCheckable(True)
+        self.order_btn.setToolTip("Toggle between File Order and Strip Order (A1, A2...)")
+        self.order_btn.clicked.connect(self._toggle_order)
+        top_bar.addWidget(self.order_btn)
+
+        # Filter dropdown
+        top_bar.addWidget(QLabel("Filter:"))
+        self.filter_combo = QComboBox()
+        self.filter_combo.addItems(["ALL", "OK", "WARN", "ERROR"])
+        self.filter_combo.setToolTip("Filter visible patches by reading status")
+        self.filter_combo.currentTextChanged.connect(self._update_patch_filter)
+        top_bar.addWidget(self.filter_combo)
 
         self.load_btn = QPushButton("Load Chart")
         self.load_btn.clicked.connect(self._load_chart)
@@ -520,12 +632,12 @@ class ChartreadPanel(QWidget):
         ctrl_layout.addWidget(self.send_space_btn)
 
         self.send_d_btn = QPushButton("d (done)")
-        self.send_d_btn.clicked.connect(lambda: self._send_key('d\n'))
+        self.send_d_btn.clicked.connect(lambda: self._send_key('d'))
         self.send_d_btn.setEnabled(False)
         ctrl_layout.addWidget(self.send_d_btn)
 
         self.send_q_btn = QPushButton("q (quit)")
-        self.send_q_btn.clicked.connect(lambda: self._send_key('q\n'))
+        self.send_q_btn.clicked.connect(lambda: self._send_key('q'))
         self.send_q_btn.setEnabled(False)
         ctrl_layout.addWidget(self.send_q_btn)
 
@@ -572,6 +684,28 @@ class ChartreadPanel(QWidget):
         self.misread_group.setVisible(False)
         layout.addWidget(self.misread_group)
 
+    def _update_patch_filter(self):
+        """Update dimming state for patches based on current filter mode."""
+        mode = self.filter_combo.currentText()
+        de_warn = self.de_warn_spin.value()
+        de_err = self.de_err_spin.value()
+
+        for patch in self.chart_grid.patches:
+            if mode == "ALL":
+                patch.set_dimmed(False)
+            elif mode == "OK":
+                # Keep un-dimmed if read and below warning threshold
+                is_ok = patch.is_read and (patch.delta_e is None or patch.delta_e < de_warn)
+                patch.set_dimmed(not is_ok)
+            elif mode == "WARN":
+                # Keep un-dimmed if between warn and err thresholds
+                is_warn = (patch.delta_e is not None and de_warn <= patch.delta_e < de_err)
+                patch.set_dimmed(not is_warn)
+            elif mode == "ERROR":
+                # Keep un-dimmed if error threshold met or exceeded
+                is_err = (patch.delta_e is not None and patch.delta_e >= de_err)
+                patch.set_dimmed(not is_err)
+
     def _browse_dir(self):
         d = QFileDialog.getExistingDirectory(self, "Select Working Directory")
         if d:
@@ -582,39 +716,6 @@ class ChartreadPanel(QWidget):
             self.work_dir_edit.setText(work_dir)
         if basename:
             self.basename_edit.setText(basename)
-
-    def _load_chart(self):
-        """Load the .ti2 file and display the chart grid."""
-        work_dir = self.work_dir_edit.text()
-        basename = self.basename_edit.text()
-        if not work_dir or not basename:
-            QMessageBox.warning(self, "Error", "Set working directory and base name first.")
-            return
-
-        ti2_path = Path(work_dir) / f"{basename}.ti2"
-        if not ti2_path.exists():
-            QMessageBox.warning(self, "Error",
-                f"File not found: {ti2_path}\nRun printtarg first.")
-            return
-
-        try:
-            self.ti2_data = CGATSFile.parse(ti2_path)
-        except Exception as e:
-            QMessageBox.critical(self, "Parse Error", f"Failed to parse .ti2:\n{e}")
-            return
-
-        cs = self.ti2_data.get_color_space() or 'CMYK'
-        self.chart_grid.load_chart(self.ti2_data, cs)
-
-        n = self.ti2_data.get_num_patches()
-        strips = self.ti2_data.get_strip_layout()
-        n_strips = len(strips) if strips else '?'
-        self.stats_lbl.setText(
-            f"Chart loaded: {n} patches, {n_strips} strips | "
-            f"Read: 0/{n} | Misreads: 0")
-
-        self.console.append(f"Loaded chart: {ti2_path}")
-        self.console.append(f"  {n} patches, {n_strips} strips, colorspace: {cs}")
 
     def _build_args(self):
         args = ['-v']
@@ -666,7 +767,7 @@ class ChartreadPanel(QWidget):
         self.input_edit.setEnabled(True)
         self.send_btn.setEnabled(True)
 
-        self.process.start('chartread', args, work_dir)
+        self.process.start_in_console('chartread', args, work_dir)
 
     def _stop_reading(self):
         self.process.terminate()
@@ -796,38 +897,43 @@ class ChartreadPanel(QWidget):
         self._update_stats()
 
     def _add_misread_row(self, patch, measured_lab, delta_e):
-        """Add a row to the misread warning table."""
+        """Add a row to the misread warning table using dynamic thresholds."""
+        de_warn = self.de_warn_spin.value()
+        de_err = self.de_err_spin.value()
+
+        self.misread_group.setTitle(f"Potential Misreads (dE94 >= {de_warn:.1f})")
         self.misread_group.setVisible(True)
         row = self.misread_table.rowCount()
         self.misread_table.insertRow(row)
 
         self.misread_table.setItem(row, 0, QTableWidgetItem(patch.location))
 
-        c, m, y, k = patch.cmyk
-        self.misread_table.setItem(row, 1,
-            QTableWidgetItem(f"{c:.0f} {m:.0f} {y:.0f} {k:.0f}"))
+        if patch.device_vals:
+            dev_str = " ".join(f"{v:.0f}" for v in patch.device_vals)
+            self.misread_table.setItem(row, 1, QTableWidgetItem(dev_str))
+        else:
+            self.misread_table.setItem(row, 1, QTableWidgetItem(""))
 
         if patch.expected_lab:
             L, a, b = patch.expected_lab
-            self.misread_table.setItem(row, 2,
-                QTableWidgetItem(f"{L:.1f} {a:.1f} {b:.1f}"))
+            self.misread_table.setItem(row, 2, QTableWidgetItem(f"{L:.1f} {a:.1f} {b:.1f}"))
 
         L, a, b = measured_lab
-        self.misread_table.setItem(row, 3,
-            QTableWidgetItem(f"{L:.1f} {a:.1f} {b:.1f}"))
+        self.misread_table.setItem(row, 3, QTableWidgetItem(f"{L:.1f} {a:.1f} {b:.1f}"))
 
         de_item = QTableWidgetItem(f"{delta_e:.2f}")
-        if delta_e > 10:
-            de_item.setBackground(QBrush(QColor(255, 100, 100)))
+        if delta_e >= de_err:
+            de_item.setBackground(QBrush(QColor(255, 100, 100)))  # Red
         else:
-            de_item.setBackground(QBrush(QColor(255, 200, 100)))
+            de_item.setBackground(QBrush(QColor(255, 200, 100)))  # Yellow/Orange
         self.misread_table.setItem(row, 4, de_item)
-
+    
     def _update_stats(self):
-        """Update the statistics label."""
+        """Update status summary bar using active spinbox thresholds."""
         total = self.ti2_data.get_num_patches() if self.ti2_data else 0
         strips = self.ti2_data.get_strip_layout() if self.ti2_data else {}
         done_strips = sum(1 for s in self.strip_status.values() if s == 'done')
+        de_warn = self.de_warn_spin.value()
 
         warning = ""
         if self._misread_count > 0:
@@ -836,7 +942,7 @@ class ChartreadPanel(QWidget):
         self.stats_lbl.setText(
             f"Read: {self._total_read}/{total} patches | "
             f"Strips: {done_strips}/{len(strips)} | "
-            f"Misreads (dE>5): {self._misread_count}{warning}")
+            f"Misreads (dE>={de_warn:.1f}): {self._misread_count}{warning}")
 
         if self._misread_count > 0:
             self.stats_lbl.setStyleSheet(
@@ -846,13 +952,49 @@ class ChartreadPanel(QWidget):
             self.stats_lbl.setStyleSheet(
                 "QLabel { padding: 4px; background: #ccffcc; "
                 "border-radius: 3px; }")
-
+    
     def _on_patch_clicked(self, index):
-        """Show detail for clicked patch."""
+        """Show detail for clicked patch with dynamic thresholds."""
         patch = self.chart_grid.get_patch_by_index(index)
         if patch:
-            self.detail_panel.show_patch(patch)
+            self._current_selected_index = index
+            self.detail_panel.show_patch(
+                patch,
+                de_warn=self.de_warn_spin.value(),
+                de_err=self.de_err_spin.value()
+            )
 
+    def _on_threshold_changed(self):
+        """Update swatch thresholds, filter misreads, and update table/stats."""
+        de_warn = self.de_warn_spin.value()
+        de_err = self.de_err_spin.value()
+
+        # Update swatch border thresholds
+        for patch in self.chart_grid.patches:
+            patch.set_thresholds(de_warn, de_err)
+
+        # Re-populate misread table with updated threshold
+        self.misread_table.setRowCount(0)
+        self._misread_count = 0
+
+        for patch in self.chart_grid.patches:
+            if patch.delta_e is not None and patch.delta_e >= de_warn:
+                self._misread_count += 1
+                if patch.measured_lab:
+                    self._add_misread_row(patch, patch.measured_lab, patch.delta_e)
+
+        if self._misread_count == 0:
+            self.misread_group.setVisible(False)
+
+        # Refresh currently selected patch in detail panel if active
+        if hasattr(self, '_current_selected_index'):
+            self._on_patch_clicked(self._current_selected_index)
+
+        self._save_settings()
+        self._update_stats()
+        self._update_patch_filter()
+
+    @Slot(int, str)
     def _on_finished(self, exit_code, status):
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
@@ -863,18 +1005,24 @@ class ChartreadPanel(QWidget):
         self.input_edit.setEnabled(False)
         self.send_btn.setEnabled(False)
 
-        if exit_code == 0:
-            self.console.append("\n--- Chartread completed successfully ---")
-            ti3 = Path(self.work_dir_edit.text()) / f"{self.basename_edit.text()}.ti3"
+        ti3 = Path(self.work_dir_edit.text()) / f"{self.basename_edit.text()}.ti3"
+
+        if exit_code == 0 or (ti3.exists() and status == 'normal'):
+            self.console.append("\n--- Chartread completed ---")
             if ti3.exists():
                 self.console.append(f"Output: {ti3}")
-                # Parse .ti3 and update all patch measurements
                 self._load_ti3_results(ti3)
+        elif status == 'normal':
+            self.console.append(f"\n--- Chartread closed by user (exit code {exit_code}) ---")
         else:
-            self.console.append(f"\n--- Chartread exited (code {exit_code}, {status}) ---")
+            self.console.append(
+                f'<span style="color: #ff4444; font-weight: bold;">'
+                f'\n[ERROR] Chartread failed with exit code {exit_code}. Check instrument connection or arguments.'
+                f'</span>'
+            )
 
     def _load_ti3_results(self, ti3_path):
-        """After chartread completes, load .ti3 and update all patch visuals."""
+        """Parse measurements from .ti3 and apply current thresholds."""
         try:
             ti3 = CGATSFile.parse(ti3_path)
         except Exception as e:
@@ -896,6 +1044,9 @@ class ChartreadPanel(QWidget):
         self._total_read = 0
         self.misread_table.setRowCount(0)
 
+        de_warn = self.de_warn_spin.value()
+        de_err = self.de_err_spin.value()
+
         for ti3_row in ti3.data:
             sample_id = ti3_row.get('SAMPLE_ID', ti3_row.get('SampleID', None))
             loc = ti3_row.get('SAMPLE_LOC', '')
@@ -916,7 +1067,6 @@ class ChartreadPanel(QWidget):
 
             measured_rgb = lab_to_rgb(*measured_lab)
 
-            # Find corresponding patch
             patch = None
             if loc:
                 patch = self.chart_grid.get_patch_by_location(loc)
@@ -928,14 +1078,14 @@ class ChartreadPanel(QWidget):
                 if patch.expected_lab:
                     delta_e = delta_e_94(patch.expected_lab, measured_lab)
 
+                patch.set_thresholds(de_warn, de_err)
                 patch.set_measured(measured_rgb, lab=measured_lab, delta_e=delta_e)
                 self._total_read += 1
 
-                if delta_e is not None and delta_e > 5:
+                if delta_e is not None and delta_e >= de_warn:
                     self._misread_count += 1
                     self._add_misread_row(patch, measured_lab, delta_e)
 
-        # Mark all strips as done
         strips = self.ti2_data.get_strip_layout()
         for strip_name in strips:
             self.chart_grid.mark_strip_done(strip_name)
@@ -944,4 +1094,124 @@ class ChartreadPanel(QWidget):
         self._update_stats()
         self.console.append(
             f"Loaded {self._total_read} measurements. "
-            f"Misreads (dE>5): {self._misread_count}")
+            f"Misreads (dE>={de_warn:.1f}): {self._misread_count}")
+        self._update_patch_filter()
+    
+    def _toggle_order(self):
+        """Toggle grid layout order between File Order and Strip Order."""
+        is_strip_order = self.order_btn.isChecked()
+        self.order_btn.setText("Order: Strip (A1...)" if is_strip_order else "Order: File")
+        
+        self.settings.setValue("order_by_strip", is_strip_order)
+
+        if self.ti2_data:
+            # Preserve existing measurements before reloading layout
+            existing_measurements = {
+                p.index: (p.measured_rgb, p.measured_lab, p.delta_e)
+                for p in self.chart_grid.patches if p.is_read
+            }
+
+            cs = self.ti2_data.get_color_space() or 'CMYK'
+            de_warn = self.de_warn_spin.value()
+            de_err = self.de_err_spin.value()
+
+            # Re-render layout
+            self.chart_grid.load_chart(self.ti2_data, cs, order_by_strip=is_strip_order)
+
+            # Re-apply measurements and thresholds
+            for patch in self.chart_grid.patches:
+                patch.set_thresholds(de_warn, de_err)
+                if patch.index in existing_measurements:
+                    m_rgb, m_lab, de = existing_measurements[patch.index]
+                    patch.set_measured(m_rgb, lab=m_lab, delta_e=de)
+
+            # If a .ti3 exists on disk, reload readings to ensure full sync
+            work_dir = self.work_dir_edit.text()
+            basename = self.basename_edit.text()
+            if work_dir and basename:
+                ti3_path = Path(work_dir) / f"{basename}.ti3"
+                if ti3_path.exists():
+                    self._load_ti3_results(ti3_path)
+
+            if hasattr(self, '_current_selected_index'):
+                self._on_patch_clicked(self._current_selected_index)
+            
+            self._update_patch_filter()
+
+    def _load_chart(self):
+        """Load the .ti2 file and display chart grid using active order setting."""
+        work_dir = self.work_dir_edit.text()
+        basename = self.basename_edit.text()
+        if not work_dir or not basename:
+            QMessageBox.warning(self, "Error", "Set working directory and base name first.")
+            return
+
+        ti2_path = Path(work_dir) / f"{basename}.ti2"
+        if not ti2_path.exists():
+            QMessageBox.warning(self, "Error", f"File not found: {ti2_path}\nRun printtarg first.")
+            return
+
+        try:
+            self.ti2_data = CGATSFile.parse(ti2_path)
+        except Exception as e:
+            QMessageBox.critical(self, "Parse Error", f"Failed to parse .ti2:\n{e}")
+            return
+
+        cs = self.ti2_data.get_color_space() or 'CMYK'
+        is_strip_order = self.order_btn.isChecked()
+        self.chart_grid.load_chart(self.ti2_data, cs, order_by_strip=is_strip_order)
+
+        # Apply current spinbox thresholds to newly generated swatches
+        de_warn = self.de_warn_spin.value()
+        de_err = self.de_err_spin.value()
+        for patch in self.chart_grid.patches:
+            patch.set_thresholds(de_warn, de_err)
+
+        n = self.ti2_data.get_num_patches()
+        strips = self.ti2_data.get_strip_layout()
+        n_strips = len(strips) if strips else '?'
+        self.stats_lbl.setText(
+            f"Chart loaded: {n} patches, {n_strips} strips | "
+            f"Read: 0/{n} | Misreads: 0")
+
+        self.console.append(f"Loaded chart: {ti2_path}")
+        self.console.append(f"  {n} patches, {n_strips} strips, colorspace: {cs}")
+
+        ti3_path = Path(work_dir) / f"{basename}.ti3"
+        if ti3_path.exists():
+            self.console.append(f"Found existing measurement file: {ti3_path}")
+            self._load_ti3_results(ti3_path)
+
+    def _save_settings(self):
+        """Save path, process parameters, threshold settings, and order mode to disk."""
+        self.settings.setValue("work_dir", self.work_dir_edit.text())
+        self.settings.setValue("basename", self.basename_edit.text())
+        self.settings.setValue("de_warn", self.de_warn_spin.value())
+        self.settings.setValue("de_err", self.de_err_spin.value())
+        self.settings.setValue("order_by_strip", self.order_btn.isChecked())
+
+    def _load_settings(self):
+        """Load stored config on startup."""
+        last_dir = self.settings.value("work_dir", "")
+        last_name = self.settings.value("basename", "profile")
+        de_warn = float(self.settings.value("de_warn", 5.0))
+        de_err = float(self.settings.value("de_err", 10.0))
+        order_by_strip = self.settings.value("order_by_strip", False, type=bool)
+
+        self.work_dir_edit.setText(last_dir)
+        self.basename_edit.setText(last_name)
+        self.de_warn_spin.setValue(de_warn)
+        self.de_err_spin.setValue(de_err)
+        
+        self.order_btn.setChecked(order_by_strip)
+        self.order_btn.setText("Order: Strip (A1...)" if order_by_strip else "Order: File")
+    
+    def _reset_defaults(self):
+        """Reset configuration parameters to defaults."""
+        self.de_warn_spin.setValue(5.0)
+        self.de_err_spin.setValue(10.0)
+        self.basename_edit.setText("profile")
+        self.settings.clear()
+        self._save_settings()
+        QMessageBox.information(self, "Reset", "Settings reset to default values.")
+    
