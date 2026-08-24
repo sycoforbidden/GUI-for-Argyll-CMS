@@ -118,7 +118,6 @@ class CGATSFile:
         return [f for f in self.fields if any(
             f.startswith(p) for p in ['CMYK_', 'RGB_', 'CMY_']
         )]
-        return dev_fields
 
     def get_cie_fields(self):
         """Return list of CIE value field names (XYZ or Lab)."""
