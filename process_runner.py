@@ -1,20 +1,11 @@
 """
 Subprocess runner for ArgyllCMS command-line tools.
-Wraps QProcess for async execution with signal-based output.
-"""
-
-import os
-from PySide6.QtCore import QObject, Signal, QProcess, QTimer
-
-"""
-Subprocess runner for ArgyllCMS command-line tools.
 Wraps subprocess and QProcess for terminal or async execution.
 """
 
 import os
 import subprocess
 from PySide6.QtCore import QObject, Signal, QProcess, QTimer
-
 
 class ArgyllProcess(QObject):
     """Manages an ArgyllCMS subprocess with terminal or async I/O."""
